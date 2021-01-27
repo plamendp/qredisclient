@@ -104,3 +104,20 @@ void TestCommand::scanCommandIsValid_data()
     QTest::newRow("Invalid value scan") << QList<QByteArray>{"set", "test", "0"} << false;
 }
 
+void TestCommand::pipelineCommand()
+{
+    RedisClient::Command cmd;
+    cmd.addToPipeline({"PING"});
+    cmd.addToPipeline({"SET", "foo"});
+    cmd.append("bar");  // Append part to previous command
+
+    QCOMPARE(cmd.isEmpty(), false);
+    QCOMPARE(cmd.isValid(), true);
+    QCOMPARE(cmd.isAuthCommand(), false);
+    QCOMPARE(cmd.isSelectCommand(), false);
+    QCOMPARE(cmd.isSubscriptionCommand(), false);
+    QCOMPARE(cmd.isUnSubscriptionCommand(), false);
+
+    QByteArray actualResult = cmd.getByteRepresentation();
+    QCOMPARE(actualResult, QByteArray("*1\r\n$5\r\nMULTI\r\n*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*1\r\n$4\r\nEXEC\r\n"));
+}

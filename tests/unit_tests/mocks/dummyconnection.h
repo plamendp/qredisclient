@@ -1,7 +1,9 @@
 #pragma once
+#include <asyncfuture.h>
 #include <QVariant>
 #include <functional>
 #include "qredisclient/connection.h"
+#include "qredisclient/responseparser.h"
 #include "qredisclient/scancommand.h"
 
 class DummyConnection : public RedisClient::Connection {
@@ -15,7 +17,7 @@ class DummyConnection : public RedisClient::Connection {
         m_version(version),
         m_raiseExceptionOnConnect(raise_error) {}
 
-  QSharedPointer<RedisClient::Connection> clone() const override {
+  QSharedPointer<RedisClient::Connection> clone(bool copyServerInfo=true) const override {
     if (m_clone) {
       return m_clone;
     }
@@ -39,9 +41,8 @@ class DummyConnection : public RedisClient::Connection {
     return m_version;
   }
 
-  void retrieveCollection(
-      const RedisClient::ScanCommand&,
-      RedisClient::Connection::CollectionCallback callback) override {
+  void retrieveCollection(const RedisClient::ScanCommand&,
+                          Connection::CollectionCallback callback) override {
     QVariant resp;
 
     if (fakeScanCollections.size()) {
@@ -53,13 +54,15 @@ class DummyConnection : public RedisClient::Connection {
     callback(resp, QString());
   }
 
-  void runCommand(const RedisClient::Command& cmd) override {
+  QFuture<RedisClient::Response> runCommand(
+      const RedisClient::Command& cmd) override {
     RedisClient::Response resp;
+    AsyncFuture::Deferred<RedisClient::Response> d;
 
     if (returnErrorOnCmdRun) {
       auto callback = cmd.getCallBack();
       callback(resp, QString("fake error"));
-      return;
+      return d.future();
     }
 
     if (fakeResponses.size()) {
@@ -74,6 +77,7 @@ class DummyConnection : public RedisClient::Connection {
 
     runCommandCalled++;
     executedCommands.push_back(cmd);
+    return d.future();
   }
 
   uint runCommandCalled;
@@ -84,16 +88,18 @@ class DummyConnection : public RedisClient::Connection {
   QList<RedisClient::Response> fakeResponses;
 
   void setFakeResponses(const QStringList& respList) {
-    for (QString response : respList) {
-      RedisClient::Response r(response.toLatin1());
-      fakeResponses.push_back(r);
-    }
+    RedisClient::ResponseParser p;
 
-    if (fakeResponses.size() > 0 &&
-        fakeResponses.first().toRawString().contains("# Keyspace")) {
-      m_serverInfo = RedisClient::ServerInfo::fromString(
-          fakeResponses.first().getValue().toString());
-      fakeResponses.removeFirst();
+    for (QString response : respList) {
+      p.feedBuffer(response.toLatin1());
+
+      if (response.contains("# Keyspace") && respList.size() > 0) {
+        m_serverInfo = RedisClient::ServerInfo::fromString(
+            p.getNextResponse().value().toString());
+        continue;
+      }
+
+      fakeResponses.push_back(p.getNextResponse());
     }
   }
 

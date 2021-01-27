@@ -4,19 +4,26 @@
 #include "qredisclient/utils/sync.h"
 
 #include <QSslConfiguration>
+#include <QNetworkProxy>
 
 RedisClient::DefaultTransporter::DefaultTransporter(RedisClient::Connection *c)
     : RedisClient::AbstractTransporter(c),
       m_socket(nullptr),
       m_errorOccurred(false) {}
 
-RedisClient::DefaultTransporter::~DefaultTransporter() {}
+RedisClient::DefaultTransporter::~DefaultTransporter() {
+    disconnectFromHost();
+}
 
 void RedisClient::DefaultTransporter::initSocket() {
   using namespace RedisClient;
 
   m_socket = QSharedPointer<QSslSocket>(new QSslSocket());
-  m_socket->setSocketOption(QAbstractSocket::KeepAliveOption, 1);
+  m_socket->setSocketOption(QAbstractSocket::KeepAliveOption, 1);  
+
+  if (!validateSystemProxy()) {
+    m_socket->setProxy(QNetworkProxy::NoProxy);
+  }
 
   connect(
       m_socket.data(),
@@ -40,9 +47,9 @@ void RedisClient::DefaultTransporter::initSocket() {
 void RedisClient::DefaultTransporter::disconnectFromHost() {
   QMutexLocker lock(&m_disconnectLock);
 
-  if (m_socket.isNull()) return;
+  RedisClient::AbstractTransporter::disconnectFromHost();
 
-  m_loopTimer->stop();
+  if (m_socket.isNull()) return;
 
   m_socket->abort();
   m_socket.clear();
@@ -97,15 +104,25 @@ bool RedisClient::DefaultTransporter::connectToHost() {
       m_socket->setLocalCertificate(localCert);
     }
 
-    m_socket->connectToHostEncrypted(conf.host(), conf.port());
-    connectionResult = m_socket->waitForEncrypted(conf.connectionTimeout());
+    SignalWaiter socketWaiter(conf.connectionTimeout());
+    socketWaiter.addAbortSignal(
+        m_socket.data(),
+        static_cast<void (QAbstractSocket::*)(QAbstractSocket::SocketError)>(
+            &QAbstractSocket::error));
+    socketWaiter.addAbortSignal(m_connection, &RedisClient::Connection::shutdownStart);
+    socketWaiter.addAbortSignal(m_socket.data(),
+                                &QAbstractSocket::disconnected);
+    socketWaiter.addSuccessSignal(m_socket.data(), &QSslSocket::encrypted);
 
+    m_socket->connectToHostEncrypted(conf.host(), conf.port());
+    connectionResult = socketWaiter.wait();
   } else {
     SignalWaiter socketWaiter(conf.connectionTimeout());
     socketWaiter.addAbortSignal(
         m_socket.data(),
         static_cast<void (QAbstractSocket::*)(QAbstractSocket::SocketError)>(
             &QAbstractSocket::error));
+    socketWaiter.addAbortSignal(this, &QObject::destroyed);
     socketWaiter.addAbortSignal(m_socket.data(),
                                 &QAbstractSocket::disconnected);
     socketWaiter.addSuccessSignal(m_socket.data(), &QAbstractSocket::connected);
@@ -134,26 +151,28 @@ void RedisClient::DefaultTransporter::sendCommand(const QByteArray &cmd) {
 
   while (total < cmd.size()) {
     sent = m_socket->write(data + total, cmd.size() - total);
-    qDebug() << "Bytes written to socket" << sent;
     total += sent;
   }
-  m_socket->flush();
+
+  if (m_socket->bytesToWrite() > 1000 || m_commands.size() == 0)
+    m_socket->flush();
 }
 
 void RedisClient::DefaultTransporter::error(
     QAbstractSocket::SocketError error) {
-  if (error == QAbstractSocket::UnknownSocketError && connectToHost() &&
+  if (error == QAbstractSocket::UnknownSocketError &&
       m_runningCommands.size() > 0) {
-    reAddRunningCommandToQueue();
-    return processCommandQueue();
+
+      if (isSocketReconnectRequired()) {
+        reAddRunningCommandToQueue();
+        return processCommandQueue();
+      }
   }
 
   m_errorOccurred = true;
 
   emit errorOccurred(
       QString("Connection error: %1").arg(m_socket->errorString()));
-
-  if (m_response.isValid()) return sendResponse(m_response);
 }
 
 void RedisClient::DefaultTransporter::sslError(const QList<QSslError> &errors) {
@@ -164,18 +183,25 @@ void RedisClient::DefaultTransporter::sslError(const QList<QSslError> &errors) {
     return;
   }
 
-  m_errorOccurred = true;
+  QString allErrors;
+
   for (QSslError err : errors)
-    emit errorOccurred(QString("SSL error: %1").arg(err.errorString()));
+      allErrors.append(QString("SSL error: %1\n").arg(err.errorString()));
+
+  if (m_connection->getConfig().ignoreAllSslErrors()) {
+      m_socket->ignoreSslErrors();
+      emit logEvent(QString("SSL: Ignoring SSL errors:\n %1").arg(allErrors));
+      return;
+  }
+
+  m_errorOccurred = true;
+  emit errorOccurred(QString("SSL errors:\n %1").arg(allErrors));
 }
 
 void RedisClient::DefaultTransporter::reconnect() {
-  if (m_loopTimer->isActive()) m_loopTimer->stop();
-
   m_socket->abort();
 
   if (connectToHost()) {
     resetDbIndex();
-    m_loopTimer->start();
   }
 }

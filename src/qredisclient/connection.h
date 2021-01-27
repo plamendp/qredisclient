@@ -9,6 +9,7 @@
 #include <QTimer>
 #include <QVariantList>
 #include <functional>
+
 #include "command.h"
 #include "connectionconfig.h"
 #include "exception.h"
@@ -18,7 +19,6 @@
 namespace RedisClient {
 
 class AbstractTransporter;
-class CommandExecutor;
 
 typedef QMap<int, int> DatabaseList;
 
@@ -58,10 +58,16 @@ class Connection : public QObject {
   enum class Mode { Normal, PubSub, Cluster, Sentinel };
   class InvalidModeException : public Connection::Exception {};
 
+  class SSHSupportException : public Connection::Exception {
+   public:
+    SSHSupportException(const QString &e);
+  };
+
  public:
   /**
    * @brief Constructs connection class
    * @param c - connection config
+   * @param autoconnect - Auto connect if disconnected
    * NOTE: different config options are required for different transporters.
    */
   Connection(const ConnectionConfig &c, bool autoConnect = true);
@@ -90,6 +96,11 @@ class Connection : public QObject {
    * @brief disconnect from redis-server
    */
   virtual void disconnect();
+
+  /**
+   * @brief disableAutoConnect
+   */
+  virtual void disableAutoConnect();
 
   /**
    * @brief getConfig
@@ -150,7 +161,7 @@ class Connection : public QObject {
    */
   virtual void getDatabaseKeys(RawKeysListCallback callback,
                                const QString &pattern = QString("*"),
-                               uint dbIndex = 0);
+                               int dbIndex = 0, long scanLimit = 10000);
 
   typedef QList<QPair<QByteArray, ulong>> RootNamespaces;
   typedef QList<QByteArray> RootKeys;
@@ -161,7 +172,7 @@ class Connection : public QObject {
   virtual void getNamespaceItems(NamespaceItemsCallback callback,
                                  const QString &nsSeparator,
                                  const QString &pattern = QString("*"),
-                                 uint dbIndex = 0);
+                                 int dbIndex = 0);
 
   /**
    * @brief getClusterKeys - async keys loading from all cluster nodes
@@ -174,7 +185,7 @@ class Connection : public QObject {
   /**
    * @brief flushDbKeys - Remove keys on all master nodes
    */
-  virtual void flushDbKeys(uint dbIndex,
+  virtual void flushDbKeys(int dbIndex,
                            std::function<void(const QString &)> callback);
 
   typedef QPair<QString, int> Host;
@@ -186,6 +197,29 @@ class Connection : public QObject {
    */
   HostList getMasterNodes();
 
+  typedef QPair<int, int> Range;
+  typedef QMap<Range, Host> ClusterSlots;
+
+  /**
+   * @brief getClusterSlots
+   * @return
+   */
+  ClusterSlots getClusterSlots();
+
+  /**
+   * @brief getClisterHost
+   * @param cmd
+   * @return
+   */
+  Host getClusterHost(const Command &cmd);
+
+  /**
+   * @brief isCommandSupported
+   * @param rawCmd
+   * @return
+   */
+  virtual QFuture<bool> isCommandSupported(QList<QByteArray> rawCmd);
+
   /*
    * Command execution API
    */
@@ -193,14 +227,14 @@ class Connection : public QObject {
    * @brief command
    * @param cmd
    */
-  void command(const Command &cmd);
+  QFuture<Response> command(const Command &cmd);
 
   /**
    * @brief Execute command without callback in async mode.
    * @param rawCmd
    * @param db
    */
-  void command(QList<QByteArray> rawCmd, int db = -1);
+  QFuture<Response> command(QList<QByteArray> rawCmd, int db = -1);
 
   /**
    * @brief Execute command with callback in async mode.
@@ -209,8 +243,48 @@ class Connection : public QObject {
    * @param callback
    * @param db
    */
-  void command(QList<QByteArray> rawCmd, QObject *owner,
-               RedisClient::Command::Callback callback, int db = -1);
+  QFuture<Response> command(QList<QByteArray> rawCmd, QObject *owner,
+                            RedisClient::Command::Callback callback,
+                            int db = -1);
+
+  /**
+   * @brief Hi-level wrapper with basic error handling
+   * @param rawCmd
+   * @param owner
+   * @param db
+   * @param callback
+   * @param errback
+   */
+  inline QFuture<Response> cmd(
+      QList<QByteArray> rawCmd, QObject *owner, int db,
+      std::function<void(const RedisClient::Response &)> callback,
+      std::function<void(const QString &)> errback) {
+    try {
+      return this->command(
+          rawCmd, owner,
+          [callback, errback](RedisClient::Response r, QString err) {
+            if (err.size() > 0) return errback(err);
+            if (r.isErrorMessage()) return errback(r.value().toString());
+
+            return callback(r);
+          },
+          db);
+    } catch (const RedisClient::Connection::Exception &e) {
+      errback(QString(e.what()));
+      return QFuture<Response>();
+    }
+  }
+
+  /**
+   * @brief pipelinedCmd
+   * @param rawCmds
+   * @param owner
+   * @param db
+   * @param callback
+   */
+  void pipelinedCmd(
+      QList<QList<QByteArray>> rawCmds, QObject *owner, int db,
+      std::function<void(const RedisClient::Response &, QString err)> callback);
 
   /**
    * @brief commandSync
@@ -226,15 +300,6 @@ class Connection : public QObject {
    * @return
    */
   Response commandSync(QList<QByteArray> rawCmd, int db = -1);
-
-  /*
-   * Aliases for ^ function
-   */
-  Response commandSync(QString cmd, int db = -1);
-  Response commandSync(QString cmd, QString arg1, int db = -1);
-  Response commandSync(QString cmd, QString arg1, QString arg2, int db = -1);
-  Response commandSync(QString cmd, QString arg1, QString arg2, QString arg3,
-                       int db = -1);
 
   /**
    * @brief CollectionCallback
@@ -264,10 +329,17 @@ class Connection : public QObject {
       const ScanCommand &cmd, IncrementalCollectionCallback callback);
 
   /**
-   * @brief runCommand - Low level commands execution API
+   * @brief runCommand
    * @param cmd
+   * @return QFuture<Response>
    */
-  virtual void runCommand(const Command &cmd);
+  virtual QFuture<Response> runCommand(const Command &cmd);
+
+  /**
+   * @brief runCommands
+   * @param commands
+   */
+  virtual void runCommands(const QList<Command> &cmd);
 
   /**
    * @brief waitForIdle - Wait until all commands in queue will be processed
@@ -279,7 +351,7 @@ class Connection : public QObject {
    * @brief create new connection object with same settings
    * @return
    */
-  virtual QSharedPointer<Connection> clone() const;
+  virtual QSharedPointer<Connection> clone(bool copyServerInfo = true) const;
 
   /*
    * Low level functions for modification
@@ -288,8 +360,10 @@ class Connection : public QObject {
   void setTransporter(QSharedPointer<AbstractTransporter>);
   QSharedPointer<AbstractTransporter> getTransporter() const;
 
+  void callAfterConnect(std::function<void(const QString &err)> callback);
+
  signals:
-  void addCommandToWorker(const Command &);
+  void addCommandsToWorker(const QList<Command> &);
   void error(const QString &);
   void log(const QString &);
   void connected();
@@ -314,9 +388,14 @@ class Connection : public QObject {
 
   void changeCurrentDbNumber(int db);
 
-  bool clusterConnectToNextMasterNode();
+  void clusterConnectToNextMasterNode(
+      std::function<void(const QString &err)> callback);
 
-  bool hasNotVisitedClusterNodes() const;
+  bool hasNotVisitedClusterNodes() const;  
+
+  void sentinelConnectToMaster();
+
+  QVariantList executeClusterSlotsCommand();
 
  protected slots:
   void auth();
@@ -330,10 +409,12 @@ class Connection : public QObject {
   ServerInfo m_serverInfo;
   Mode m_currentMode;
   QMutex m_dbNumberMutex;
+  QMutex m_blockingOp;
   bool m_autoConnect;
   bool m_stoppingTransporter;
-  RawKeysListCallback m_wrapper;
+  RawKeysListCallback m_collectClusterNodeKeys;
   RedisClient::Command::Callback m_cmdCallback;
   QSharedPointer<HostList> m_notVisitedMasterNodes;
+  ClusterSlots m_clusterSlots;
 };
 }  // namespace RedisClient
