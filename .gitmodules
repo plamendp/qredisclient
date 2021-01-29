@@ -1,3 +1,5 @@
 [submodule "3rdparty/hiredis"]
 	path = 3rdparty/hiredis
-	url = https://github.com/redis/hiredis.git
+	url = git@github.com:plamendp/hiredis.git
+	branch = redinav
+
